@@ -1,0 +1,245 @@
+import streamlit as st
+import cv2
+import numpy as np
+import easyocr
+import torch
+import re
+import random
+import os
+from ultralytics import YOLO
+
+# ==========================================
+# ۱. تنظیمات صفحه
+# ==========================================
+st.set_page_config(page_title="سیستم قرائت هوشمند کنتور", page_icon="💧", layout="wide")
+st.markdown("""
+    <style>
+    .main { background-color: #f4f7f6; }
+    .stButton>button { width: 100%; border-radius: 10px; height: 50px; font-weight: bold; background-color: #007bff; color: white; }
+    .invoice-box { background-color: white; padding: 25px; border-radius: 15px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); border-top: 5px solid #007bff; }
+    </style>
+""", unsafe_allow_html=True)
+
+# ==========================================
+# ۲. بارگذاری مدل (فقط یک بار)
+# ==========================================
+WINDOW_CLS = 10
+TOTAL_DIGITS = 8
+
+@st.cache_resource
+def load_models():
+    base = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(base, "best.pt")
+    model = YOLO(model_path)
+    reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+    return model, reader
+
+try:
+    model, reader = load_models()
+except Exception as e:
+    st.error(f"مدل یافت نشد. مطمئن شوید فایل best.pt کنار app.py است.\n\nخطا: {e}")
+    st.stop()
+
+# ==========================================
+# ۳. توابع پردازش (منطق بهبودیافته)
+# ==========================================
+def enhance(img):
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
+    out = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+    blur = cv2.GaussianBlur(out, (0, 0), 3)
+    return cv2.addWeighted(out, 1.5, blur, -0.5, 0)
+
+
+def detect_all(img, conf=0.15, imgsz=1280):
+    res = model(img, conf=conf, imgsz=imgsz, agnostic_nms=True, verbose=False)[0]
+    win, digits = None, []
+    for b in res.boxes:
+        cls = int(b.cls)
+        name = str(model.names[cls])
+        x1, y1, x2, y2 = b.xyxy[0].tolist()
+        c = float(b.conf)
+        if cls == WINDOW_CLS:
+            if win is None or c > win[4]:
+                win = (x1, y1, x2, y2, c)
+        elif name[-1].isdigit():
+            digits.append({'digit': name[-1], 'x': (x1 + x2) / 2,
+                           'y': (y1 + y2) / 2, 'w': x2 - x1, 'conf': c})
+    return win, digits, res
+
+
+def read_cell(img, cx, cy, pitch):
+    H, W = img.shape[:2]
+    hw = int(pitch * 0.6)
+    hh = int(pitch * 1.0)
+    roi = img[max(int(cy) - hh, 0):min(int(cy) + hh, H),
+              max(int(cx) - hw, 0):min(int(cx) + hw, W)]
+    if roi.size == 0:
+        return None
+    cands = []
+    for scale in (4, 6):
+        big = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4)).apply(gray)
+        for v in (gray, 255 - gray, clahe, 255 - clahe):
+            v = cv2.copyMakeBorder(v, 30, 30, 30, 30, cv2.BORDER_CONSTANT,
+                                   value=int(v.mean()))
+            for item in reader.readtext(v, allowlist="0123456789", detail=1):
+                txt = re.sub(r"\D", "", item[1])
+                if len(txt) == 1 and item[2] > 0.1:
+                    cands.append((item[2], txt))
+    if not cands:
+        return None
+    conf, digit = max(cands)
+    return digit
+
+
+def read_meter_auto(img_orig):
+    img = enhance(img_orig)
+    H, W = img.shape[:2]
+
+    attempts = [
+        (img, "افقی"),
+        (cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE), "چرخش ۹۰"),
+        (cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE), "چرخش ۲۷۰"),
+    ]
+
+    best_attempt = None
+    max_digits_found = 0
+
+    for test_img, desc in attempts:
+        win, digits, res = None, [], None
+        for imgsz, conf in [(1280, 0.15), (1280, 0.05), (1920, 0.05), (640, 0.05)]:
+            win, digits, res = detect_all(test_img, conf, imgsz)
+            if win is not None:
+                x1, y1, x2, y2, _ = win
+                digits = [d for d in digits if x1 - 10 <= d['x'] <= x2 + 10 and y1 - 10 <= d['y'] <= y2 + 10]
+            if digits:
+                break
+        if len(digits) > max_digits_found:
+            max_digits_found = len(digits)
+            best_attempt = (test_img, win, digits, res, desc)
+
+    if best_attempt is None or max_digits_found == 0:
+        return "هیچ عددی پیدا نشد", img_orig, "—"
+
+    img, win, digits, res, desc = best_attempt
+    H, W = img.shape[:2]
+    digits.sort(key=lambda d: d['x'])
+
+    if win is not None:
+        x1, y1, x2, y2, _ = win
+    else:
+        x1 = min([d['x'] - d['w'] / 2 for d in digits])
+        x2 = max([d['x'] + d['w'] / 2 for d in digits])
+        y1 = min([d['y'] for d in digits]) - 20
+        y2 = max([d['y'] for d in digits]) + 20
+
+    w_box = x2 - x1
+    x1_ext = max(0, x1 - (w_box * 0.1))
+    x2_ext = min(W, x2 + (w_box * 0.2))
+    crop = img[max(int(y1) - 10, 0):int(y2) + 10, int(x1_ext):int(x2_ext)]
+
+    digit_chars = None
+
+    if len(digits) == TOTAL_DIGITS - 1:
+        xs = [d['x'] for d in digits]
+        pitch = float(np.median(np.diff(xs)))
+        y_c = float(np.median([d['y'] for d in digits]))
+        if pitch > 0:
+            gap_left = xs[0] - x1
+            gap_right = x2 - xs[-1]
+            missing_right = gap_right >= gap_left
+            cx = xs[-1] + pitch if missing_right else xs[0] - pitch
+            val = read_cell(img, cx, y_c, pitch) or "?"
+            chars = [d['digit'] for d in digits]
+            digit_chars = chars + [val] if missing_right else [val] + chars
+
+    if digit_chars is None and len(digits) < TOTAL_DIGITS - 1:
+        big_crop = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+        gray_crop = cv2.cvtColor(big_crop, cv2.COLOR_BGR2GRAY)
+        r = reader.readtext(gray_crop, allowlist="0123456789", detail=1)
+        r.sort(key=lambda t: (t[0][0][0] + t[0][1][0]) / 2)
+        digit_str = "".join([t[1] for t in r if len(t[1]) > 0])
+        if len(re.sub(r"\D", "", digit_str)) < 5:
+            digit_str = "".join([d['digit'] for d in digits])
+        digit_chars = list(re.sub(r"\D", "", digit_str))
+
+    if digit_chars is None:
+        digit_chars = [d['digit'] for d in digits]
+
+    clean = "".join(digit_chars)
+
+    if len(clean) == TOTAL_DIGITS and '?' not in clean:
+        final_num = clean[:-3] + "." + clean[-3:]
+    else:
+        final_num = clean
+
+    return final_num, crop, desc
+
+
+# ==========================================
+# ۴. رابط کاربری
+# ==========================================
+st.title("💧 سیستم هوشمند قرائت کنتور و صدور قبض")
+st.markdown("---")
+
+with st.sidebar:
+    st.header("📸 آپلود تصویر")
+    uploaded_file = st.file_uploader("عکس کنتور خود را انتخاب کنید", type=["jpg", "jpeg", "png"])
+
+if uploaded_file is not None:
+    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+    img_bgr = cv2.imdecode(file_bytes, 1)
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.markdown("### 🖼️ تصویر اصلی")
+        st.image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), use_column_width=True)
+
+        with st.spinner("⏳ در حال پردازش..."):
+            final_num, crop, desc = read_meter_auto(img_bgr)
+
+        if final_num != "هیچ عددی پیدا نشد":
+            st.success(f"✅ عدد استخراج شده: **{final_num}**")
+            st.caption(f"حالت تشخیص: {desc}")
+            st.image(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB),
+                     caption="ناحیه برش‌خورده", use_column_width=True)
+        else:
+            st.error("❌ عددی تشخیص داده نشد.")
+
+    with col2:
+        if final_num != "هیچ عددی پیدا نشد":
+            st.markdown("### 🧾 فیش قبض صادر شده")
+            try:
+                current_usage = float(final_num.replace("?", "0"))
+                prev = max(0, current_usage - random.uniform(2.0, 8.0))
+                cons = current_usage - prev
+                price = cons * 15000
+                invoice = (
+                    f"🔢 قرائت قبلی: {prev:.3f} m³\n"
+                    f"🔢 قرائت فعلی: {current_usage:.3f} m³\n"
+                    f"💧 مصرف: {cons:.3f} m³\n\n"
+                    f"💰 مبلغ قابل پرداخت: {price:,.0f} تومان"
+                )
+            except Exception:
+                invoice = "خطا در محاسبه"
+
+            st.markdown(f"""
+            <div class="invoice-box">
+                <h2 style="text-align: center; color: #007bff;">شرکت آب و فاضلاب</h2>
+                <hr>
+                <p><b>شماره قبض:</b> {random.randint(100000, 999999)}</p>
+                <p><b>تاریخ:</b> 1402/08/15</p>
+                <hr>
+                <pre style="font-size: 16px; line-height: 2;">{invoice}</pre>
+            </div>
+            """, unsafe_allow_html=True)
+
+            if st.button("💳 پرداخت قبض (شبیه‌سازی)"):
+                st.balloons()
+                st.success("پرداخت با موفقیت انجام شد!")
+else:
+    st.info("👈 لطفاً از منوی سمت چپ، عکس کنتور را آپلود کنید.")
